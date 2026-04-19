@@ -48,7 +48,7 @@ class DefaultConfig:
     TTS_RETRY_COUNT = 3  # TTS失败重试次数
     
     # 资源限制
-    MAX_PROJECT_TEXT_SIZE = 5000000  # 单个项目最大字数
+    MAX_PROJECT_TEXT_SIZE = 50000000  # 单个项目最大字数
     MAX_VIDEO_SEGMENT_DURATION = 3600  # 单个视频片段最大时长(秒)
     MAX_TEMP_FILE_SIZE = 50 * 1024 * 1024 * 1024  # 临时文件最大占用50GB
     

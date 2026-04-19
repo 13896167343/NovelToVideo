@@ -8,6 +8,8 @@ from app.utils.logger import get_logger
 from app.utils.file_handler import FileHandler
 from config import DefaultConfig
 import os
+import uuid
+import time
 
 logger = get_logger(__name__)
 
@@ -26,11 +28,108 @@ def index():
         return render_template('project_list.html', projects=[])
 
 
+@project_bp.route('/upload-file', methods=['POST'])
+def upload_file():
+    """异步文件上传接口 - 支持大文件上传，避免浏览器卡死"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': '没有文件'}), 400
+        
+        file = request.files['file']
+        
+        if not file.filename.endswith('.txt'):
+            return jsonify({'success': False, 'error': '仅支持.txt文件'}), 400
+        
+        # 检查文件大小（50MB限制）
+        max_size = 50 * 1024 * 1024
+        file.seek(0, 2)  # 跳到文件末尾
+        file_size = file.tell()
+        file.seek(0)  # 回到文件开头
+        
+        if file_size > max_size:
+            return jsonify({'success': False, 'error': '文件大小不能超过50MB'}), 400
+        
+        # 生成临时文件名
+        temp_id = str(uuid.uuid4())
+        temp_filename = f"{temp_id}.txt"
+        temp_dir = DefaultConfig.TEMP_DIR
+        FileHandler.ensure_dir(temp_dir)
+        temp_path = os.path.join(temp_dir, temp_filename)
+        
+        # 保存文件
+        file.save(temp_path)
+        logger.info(f'文件上传成功: {temp_path}, 大小: {file_size} bytes')
+        
+        # 只读取前100KB进行编码检测和预览，避免内存占用
+        preview_size = min(file_size, 100 * 1024)  # 最多读取100KB
+        preview_data, detected_encoding = FileHandler.read_text_file(temp_path)
+        
+        if preview_data is None:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return jsonify({'success': False, 'error': '无法读取文件内容，请检查文件编码'}), 400
+        
+        # 获取预览内容（前1000字符）
+        content_preview = preview_data[:1000]
+        preview_char_count = len(content_preview)
+        
+        # 估算总字符数（基于文件大小和预览的平均字符长度）
+        # 假设文件内容均匀分布
+        estimated_total_chars = int((file_size / preview_size) * preview_char_count) if preview_size > 0 else 0
+        
+        # 返回结果（包含临时文件ID供后续使用，不返回完整内容）
+        return jsonify({
+            'success': True,
+            'message': f'上传成功，文件大小: {(file_size/1024/1024):.2f}MB',
+            'file_size': file_size,
+            'encoding': detected_encoding,
+            'temp_id': temp_id,
+            'content_preview': content_preview,
+            'estimated_chars': estimated_total_chars
+        })
+        
+    except Exception as e:
+        logger.error(f'文件上传失败: {str(e)}', exc_info=True)
+        return jsonify({'success': False, 'error': f'上传失败: {str(e)}'}), 500
+
+
+@project_bp.route('/get-file-content/<temp_id>', methods=['GET'])
+def get_file_content(temp_id):
+    """获取临时文件内容 - 支持分块加载，避免大文件导致浏览器卡死"""
+    try:
+        temp_filename = f"{temp_id}.txt"
+        temp_path = os.path.join(DefaultConfig.TEMP_DIR, temp_filename)
+        
+        if not os.path.exists(temp_path):
+            return jsonify({'success': False, 'error': '文件不存在或已过期'}), 404
+        
+        # 读取文件内容
+        content, detected_encoding = FileHandler.read_text_file(temp_path)
+        
+        if content is None:
+            return jsonify({'success': False, 'error': '无法读取文件内容'}), 500
+        
+        char_count = len(content)
+        
+        return jsonify({
+            'success': True,
+            'content': content,
+            'char_count': char_count,
+            'encoding': detected_encoding
+        })
+        
+    except Exception as e:
+        logger.error(f'获取文件内容失败: {str(e)}', exc_info=True)
+        return jsonify({'success': False, 'error': f'获取失败: {str(e)}'}), 500
+
+
 @project_bp.route('/create', methods=['GET', 'POST'])
 def create():
     """创建项目"""
     if request.method == 'GET':
         return render_template('project_create.html')
+    
+    temp_file_path = None
     
     try:
         # 支持 JSON 和表单两种提交方式
@@ -39,6 +138,7 @@ def create():
             data = request.get_json(silent=True) or {}
             name = str(data.get('name', '')).strip()
             description = str(data.get('description', '')).strip()
+            temp_id = data.get('temp_id')
             text_content = str(data.get('text_content', '')).strip()
             # 解析配置（兼容字符串/列表/数值）
             resolution_val = data.get('resolution', '1920,1080')
@@ -60,6 +160,7 @@ def create():
             # 获取表单数据
             name = request.form.get('name', '').strip()
             description = request.form.get('description', '').strip()
+            temp_id = request.form.get('temp_id')
             text_content = request.form.get('text_content', '').strip()
             resolution = tuple(map(int, request.form.get('resolution', '1920,1080').split(',')))
             fps = int(request.form.get('fps', 30))
@@ -107,8 +208,36 @@ def create():
         if not name:
             return jsonify({'success': False, 'error': '项目名称不能为空'}), 400
         
-        if not text_content:
+        # 处理临时文件或文本内容
+        if temp_id:
+            # 从文件上传方式：读取临时文件内容
+            temp_filename = f"{temp_id}.txt"
+            temp_file_path = os.path.join(DefaultConfig.TEMP_DIR, temp_filename)
+            
+            if not os.path.exists(temp_file_path):
+                return jsonify({'success': False, 'error': '文件不存在或已过期，请重新上传'}), 400
+            
+            logger.info(f'正在读取临时文件: {temp_file_path}')
+            
+            # 读取完整文件内容
+            text_content, detected_encoding = FileHandler.read_text_file(temp_file_path)
+            
+            if text_content is None:
+                return jsonify({'success': False, 'error': '无法读取文件内容，请检查文件编码'}), 400
+            
+            # 检查字数限制（5000万字）
+            char_count = len(text_content)
+            if char_count > 50000000:
+                return jsonify({'success': False, 'error': f'文件太大({char_count}字)，最多支持5000万字'}), 400
+            
+            logger.info(f'从临时文件读取成功，编码: {detected_encoding}, 字符数: {char_count}')
+            
+        elif not text_content:
             return jsonify({'success': False, 'error': '文本内容不能为空'}), 400
+        else:
+            # 从文本框粘贴方式：直接使用 text_content
+            char_count = len(text_content)
+            logger.info(f'从文本框读取成功，字符数: {char_count}')
         
         # 创建项目
         project_id, error = ProjectService.create_project(name, description, text_content, config)
@@ -116,15 +245,33 @@ def create():
         if error:
             return jsonify({'success': False, 'error': error}), 400
         
+        # 创建成功后删除临时文件（如果存在）
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                logger.info(f'临时文件已删除: {temp_file_path}')
+            except Exception as e:
+                logger.warning(f'删除临时文件失败: {temp_file_path}, 错误: {str(e)}')
+        
         # 不再自动提交任务，而是返回成功信息
         return jsonify({
             'success': True,
             'project_id': project_id,
-            'message': '项目创建成功，请点击开始处理按钮启动任务'
+            'message': f'项目创建成功，字符数: {char_count}',
+            'char_count': char_count
         })
         
     except Exception as e:
         logger.error(f'创建项目失败: {str(e)}', exc_info=True)
+        
+        # 确保临时文件被清理
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                logger.info(f'异常时临时文件已清理: {temp_file_path}')
+            except Exception:
+                pass
+        
         return jsonify({'success': False, 'error': f'创建项目失败: {str(e)}'}), 500
 
 

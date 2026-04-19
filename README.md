@@ -52,14 +52,14 @@
 
 1. **确保已安装Docker**
 
-2. **构建并启动容器**
+2. **选择部署方式**
 
 ```bash
-# 克隆或下载项目
-cd NovelToVideo
-
-# 使用docker-compose启动服务
+# 方式一：拉取远程镜像（适用于生产环境）
 docker-compose up -d
+
+# 方式二：本地构建镜像（适用于开发和调试）
+docker-compose -f docker-compose-local.yml up -d --build
 ```
 
 3. **访问Web界面**
@@ -69,8 +69,14 @@ docker-compose up -d
 4. **停止服务**
 
 ```bash
+# 停止远程镜像版本
 docker-compose down
+
+# 停止本地构建版本
+docker-compose -f docker-compose-local.yml down
 ```
+
+> 💡 **提示**: `docker-compose-local.yml` 使用本地 Dockerfile 构建镜像，适合开发调试时修改代码后快速重新构建。
 
 ### 传统安装方式
 
@@ -216,7 +222,7 @@ run.py                         # 应用入口
 系统接收小说文本后,会自动进行:
 - 文本编码检测与转换
 - 非法字符过滤
-- 文本长度验证(最大500万字)
+- 文本长度验证(最大5000万字)
 
 ### 2. 文本分段
 
@@ -269,7 +275,7 @@ run.py                         # 应用入口
 
 - 最大线程数: 16
 - 最大并发项目数: 5
-- 单个项目最大字数: 500万字
+- 单个项目最大字数: 5000万字
 - 临时文件最大占用: 50GB
 
 ## 常见问题

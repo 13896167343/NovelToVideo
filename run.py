@@ -11,6 +11,7 @@ from app import create_app
 from app.utils.database import init_db
 from app.utils.logger import get_logger
 from app.utils.migrations import run_migrations
+from app.utils.file_handler import FileHandler
 from config import DevelopmentConfig, ProductionConfig
 
 logger = get_logger(__name__)
@@ -45,6 +46,14 @@ def main():
             logger.info('数据库迁移完成')
         except Exception as e:
             logger.error(f'数据库迁移异常: {str(e)}', exc_info=True)
+        
+        # 清理过期的临时文件（超过24小时的）
+        try:
+            if os.path.exists(DefaultConfig.TEMP_DIR):
+                FileHandler.clean_temp_files(DefaultConfig.TEMP_DIR, max_age_hours=24)
+                logger.info('临时文件清理完成')
+        except Exception as e:
+            logger.warning(f'临时文件清理失败: {str(e)}')
     
     # 启动应用
     logger.info('启动Flask应用...')
