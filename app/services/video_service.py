@@ -332,7 +332,14 @@ class VideoService:
             VideoService._cleanup_orphaned_temp_files(project_id, temp_video_dir)
             FileHandler.ensure_dir(output_path)
             
-            # 调用新的队列驱动方法处理视频合成
+            # 先创建视频合成队列记录
+            logger.info(f'开始生成视频合成队列: project_id={project_id}')
+            queue_created = VideoService.generate_and_save_queue(project_id)
+            if not queue_created:
+                logger.error(f'生成视频合成队列失败: project_id={project_id}')
+                return False
+            
+            # 调用队列驱动方法处理视频合成
             return VideoService._synthesize_from_queue(
                 project_id,
                 temp_video_dir,
