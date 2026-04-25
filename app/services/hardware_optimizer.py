@@ -310,7 +310,7 @@ class VideoEncodingOptimizer:
             return False
     
     def get_encoding_options(self) -> Dict[str, Any]:
-        """获取moviepy write_videofile方法的编码选项"""
+        """获取视频编码选项"""
         params = self.get_optimal_params()
         
         options = {
@@ -334,7 +334,7 @@ class VideoEncodingOptimizer:
         return {
             'write_logfile': False,  # 不写日志文件以节省I/O
             'verbose': False,
-            'logger': None,  # moviepy不输出日志
+            'logger': None,  # 不输出日志
             'threads': params['threads'],
             'buffer_size': params['buffer_size_mb'],
             'memory_efficient': params['memory_efficient'],

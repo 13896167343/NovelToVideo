@@ -1,18 +1,14 @@
 """视频生成服务"""
 import os
-import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import AudioFileClip, ImageClip, concatenate_videoclips
 from app.models.text_segment import TextSegment
 from app.models.video_segment import VideoSegment
 from app.models.task import Task
 from app.models.project import Project
 from app.models.temp_video_segment import TempVideoSegment
-from app.models.video_synthesis_queue import VideoSynthesisQueue
 from app.utils.logger import get_logger
 from app.utils.file_handler import FileHandler
 from config import DefaultConfig
-from app.services.hardware_optimizer import get_optimizer
 
 logger = get_logger(__name__)
 
@@ -62,13 +58,20 @@ class VideoService:
                     if segment.audio_duration is not None and segment.audio_duration > 0:
                         duration = segment.audio_duration
                     else:
-                        # 如果数据库没有时长，从音频文件读取
+                        # 如果数据库没有时长，使用 ffprobe 获取音频时长
+                        import subprocess
                         audio_path = segment.get_absolute_audio_path()
                         if os.path.exists(audio_path):
-                            from moviepy.editor import AudioFileClip
-                            audio_clip = AudioFileClip(audio_path)
-                            duration = audio_clip.duration
-                            audio_clip.close()
+                            try:
+                                result = subprocess.run(
+                                    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+                                     '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
+                                    capture_output=True, text=True, encoding='utf-8'
+                                )
+                                duration = float(result.stdout.strip())
+                            except Exception as e:
+                                logger.warning(f'读取音频时长失败: {audio_path}, {e}')
+                                duration = 0
                         else:
                             logger.warning(f'音频文件不存在: {audio_path}')
                             duration = 0
@@ -180,11 +183,10 @@ class VideoService:
         """
         生成项目的所有视频
         
-        新流程（智能分组合成）：
-        1. 识别已完成的音频时长
-        2. 按用户的 segment_duration 自动分组，选择时长最接近的音频合成
-        3. 记录已合成的音频，不参与下一个视频合成
-        4. 将临时文件保存在 temp 文件夹，然后移动到 output 文件夹
+        流程：
+        1. 检查音频合成进度是否达到100%
+        2. 生成背景图片
+        3. 调用新流程方法处理视频合成
         
         Args:
             project_id: 项目ID
@@ -300,11 +302,9 @@ class VideoService:
         按 segment_duration 分组合成视频
         
         流程：
-        1. 从未合成音频中识别时长
-        2. 选择相加时间最接近 segment_duration 的音频
-        3. 为这批音频创建一个视频
-        4. 记录已合成的音频，不参与后续合成
-        5. 重复步骤1-4直到所有音频都被合成
+        1. 清理临时目录中的孤立文件
+        2. 确保输出目录存在
+        3. 调用新流程方法处理视频合成
         
         Args:
             project_id: 项目ID
@@ -320,26 +320,10 @@ class VideoService:
         Returns:
             成功标志
         """
-        import shutil
-        from moviepy.editor import VideoFileClip, concatenate_videoclips
-        
-        fps = config.get('fps', DefaultConfig.DEFAULT_FPS)
-        video_format = config.get('format', DefaultConfig.DEFAULT_FORMAT)
-        bitrate = config.get('bitrate', DefaultConfig.DEFAULT_BITRATE)
-        
         try:
-            # 清理临时目录中的孤立文件（需要项目ID来查询数据库状态）
             VideoService._cleanup_orphaned_temp_files(project_id, temp_video_dir)
             FileHandler.ensure_dir(output_path)
             
-            # 先创建视频合成队列记录
-            logger.info(f'开始生成视频合成队列: project_id={project_id}')
-            queue_created = VideoService.generate_and_save_queue(project_id)
-            if not queue_created:
-                logger.error(f'生成视频合成队列失败: project_id={project_id}')
-                return False
-            
-            # 调用队列驱动方法处理视频合成
             return VideoService._synthesize_from_queue(
                 project_id,
                 temp_video_dir,
@@ -358,11 +342,11 @@ class VideoService:
         """
         使用 VideoSynthesisQueue 队列驱动的视频合成
         
-        流程：
-        1. 从 VideoSynthesisQueue 表读取待处理的队列
-        2. 对每个队列生成临时视频
-        3. 合并临时视频为最终视频
-        4. 更新状态并清理临时文件
+        新流程：
+        1. 根据用户设定的视频时长合成固定时长的临时视频
+        2. 将所有已完成的TTS音频按顺序合成为完整长音频，然后按用户设定的时长分割为固定时长的音频
+        3. 将音频和视频合成对应的完整视频文件
+        4. 最后删除临时文件，只保留最终视频和TTS音频
         
         Args:
             project_id: 项目ID
@@ -375,194 +359,145 @@ class VideoService:
         Returns:
             成功标志
         """
+        import subprocess
+        import shutil
+        
         try:
-            logger.info(f'开始使用队列驱动的视频合成: project_id={project_id}')
+            logger.info(f'开始使用新流程合成视频: project_id={project_id}')
             
-            # 从数据库获取所有未完成的队列记录（PENDING 和 SYNTHESIZING），按顺序处理
-            all_queues = VideoSynthesisQueue.get_by_project(project_id)
-            queue_records = [q for q in all_queues if q.status != VideoSynthesisQueue.STATUS_COMPLETED]
+            segment_duration = config.get('segment_duration', DefaultConfig.DEFAULT_SEGMENT_DURATION)
+            project = Project.get_by_id(project_id)
+            safe_name = FileHandler.safe_filename(project.name) if project else 'output'
             
-            if not queue_records:
-                logger.error(f'没有找到待处理的视频合成队列: project_id={project_id}')
+            all_segments = TextSegment.get_completed_segments(project_id)
+            if not all_segments:
+                logger.error(f'没有已完成的TTS音频: project_id={project_id}')
                 return False
             
-            logger.info(f'找到 {len(queue_records)} 个待处理的队列记录（已排除已完成的队列）')
+            logger.info(f'已完成的TTS音频数量: {len(all_segments)}')
             
-            # 统计进度
-            total_queue = len(queue_records)
-            completed_queue = 0
+            FileHandler.ensure_dir(output_path)
+            FileHandler.ensure_dir(temp_video_dir)
             
-            # 为了判断是否是一个特别的列表类型，轫换为dict
-            segment_map = {}
-            all_segments = TextSegment.get_by_project(project_id)
-            for seg in all_segments:
-                segment_map[seg.id] = seg
+            logger.info(f'步骤1: 将所有TTS音频按顺序合并为一个长音频')
+            audio_files = []
+            for segment in all_segments:
+                audio_abs_path = segment.get_absolute_audio_path()
+                if os.path.exists(audio_abs_path):
+                    audio_files.append(audio_abs_path)
+                else:
+                    logger.warning(f'TTS音频文件不存在: {audio_abs_path}')
             
-            # 遍历所有队列记录 - 按顺序处理，每个队列处理完毕立即合并
-            for queue_record in queue_records:
-                queue_id = queue_record.id
-                video_index = queue_record.video_index
-                temp_segment_ids = queue_record.temp_segment_ids  # TempVideoSegment ID列表
-                total_duration = queue_record.total_duration
-                
-                # 使用绝对路径
-                output_video_path = queue_record.get_absolute_output_video_path()
-                
-                logger.info(f'开始处理队列: queue_id={queue_id}, video_index={video_index}, temp_segments={len(temp_segment_ids)}')
-                
-                # 如果队列已完成，跳过
-                if queue_record.status == VideoSynthesisQueue.STATUS_COMPLETED:
-                    logger.info(f'队列 video_{video_index} 已完成，跳过')
-                    completed_queue += 1
-                    progress = completed_queue / total_queue * 100
-                    Task.update_progress(task_id, progress)
-                    continue
-                
-                # 更新队列状态为合成中
-                VideoSynthesisQueue.update_status(queue_id, VideoSynthesisQueue.STATUS_SYNTHESIZING)
-                
+            if not audio_files:
+                logger.error(f'没有可用的TTS音频文件')
+                return False
+            
+            long_audio_file = os.path.join(temp_video_dir, 'long_audio_all.mp3')
+            VideoService._merge_audio_files(audio_files, long_audio_file)
+            logger.info(f'步骤1 完成: 合并了 {len(audio_files)} 个音频文件')
+            
+            logger.info(f'步骤2: 按固定时长({segment_duration}s)分割长音频')
+            audio_segments = VideoService._split_audio_by_duration(long_audio_file, temp_video_dir, segment_duration)
+            
+            if not audio_segments:
+                logger.error(f'音频分割失败')
+                return False
+            
+            logger.info(f'步骤2 完成: 分割为 {len(audio_segments)} 个音频片段')
+            
+            logger.info(f'步骤3: 生成固定时长的临时视频')
+            total_segments = len(audio_segments)
+            temp_video_file = os.path.join(temp_video_dir, 'temp_video_fixed.mp4')
+            
+            step3a_cmd = [
+                'ffmpeg',
+                '-loop', '1',
+                '-r', '1',
+                '-t', str(segment_duration),
+                '-f', 'image2',
+                '-i', background_image,
+                '-c:v', 'libx264',
+                '-crf', '24',
+                '-pix_fmt', 'yuv420p',
+                '-y',
+                temp_video_file
+            ]
+            
+            logger.info(f'生成固定时长临时视频: duration={segment_duration}s')
+            result = subprocess.run(step3a_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600)
+            if result.returncode != 0:
+                logger.error(f'生成固定时长临时视频失败: {result.stderr}')
+                return False
+            logger.info(f'步骤3 完成: 固定时长临时视频已生成')
+            
+            logger.info(f'步骤4: 将临时视频与每个音频片段合成最终视频')
+            
+            for idx, audio_segment in enumerate(audio_segments):
                 try:
-                    # 步骤1：为该队列的每个临时视频片段生成视频
-                    temp_video_files = []
-                    temp_segment_records = []
+                    final_video_file = os.path.join(output_path, f'{safe_name}_{idx + 1:03d}.mp4')
                     
-                    logger.info(f'步骤1: 生成队列 {queue_id} 的临时视频 (共 {len(temp_segment_ids)} 个)')
-                    for temp_segment_id in temp_segment_ids:
-                        # 获取 TempVideoSegment 记录
-                        temp_seg_record = TempVideoSegment.get_by_id(temp_segment_id)
-                        if not temp_seg_record:
-                            logger.warning(f'TempVideoSegment 不存在: id={temp_segment_id}')
-                            continue
-                        
-                        text_segment_id = temp_seg_record.text_segment_id
-                        segment = segment_map.get(text_segment_id)
-                        
-                        if not segment:
-                            logger.warning(f'TextSegment 不存在: id={text_segment_id}')
-                            continue
-                        
-                        try:
-                            temp_video_abs_path = temp_seg_record.get_absolute_temp_video_path()
-                            
-                            # 判断是否需要生成临时视频
-                            need_generate = False
-                            
-                            if temp_seg_record.status == TempVideoSegment.STATUS_SYNTHESIZED:
-                                # 已合成，检查文件完整性
-                                if os.path.exists(temp_video_abs_path) and os.path.getsize(temp_video_abs_path) > 0:
-                                    logger.debug(f'临时视频已存在且完好: temp_segment_id={temp_segment_id}')
-                                    need_generate = False
-                                else:
-                                    logger.warning(f'临时视频文件缺失或损坏，需重新生成: {temp_video_abs_path}')
-                                    need_generate = True
-                            else:
-                                # PENDING或其他状态，需要生成
-                                logger.info(f'临时视频需要生成: temp_segment_id={temp_segment_id}, status={temp_seg_record.status}')
-                                need_generate = True
-                            
-                            if need_generate:
-                                audio_abs_path = segment.get_absolute_audio_path()
-                                logger.info(f'生成临时视频: temp_segment_id={temp_segment_id}, audio={os.path.basename(audio_abs_path)}')
-                                
-                                VideoService._create_and_save_video_segment(
-                                    audio_abs_path,
-                                    background_image,
-                                    temp_video_abs_path,
-                                    config
-                                )
-                            
-                            # 更新状态为 SYNTHESIZED
-                            TempVideoSegment.update_status(temp_segment_id, TempVideoSegment.STATUS_SYNTHESIZED)
-                            temp_video_files.append(temp_video_abs_path)
-                            temp_segment_records.append(temp_seg_record)
-                        
-                        except Exception as e:
-                            logger.error(f'生成临时视频失败: temp_segment_id={temp_segment_id}, error={str(e)}')
-                            raise
+                    step4_cmd = [
+                        'ffmpeg',
+                        '-i', temp_video_file,
+                        '-i', audio_segment,
+                        '-c:v', 'copy',
+                        '-c:a', 'copy',
+                        '-y',
+                        final_video_file
+                    ]
                     
-                    if not temp_video_files:
-                        logger.error(f'队列 {queue_id} 没有临时视频文件可处理')
-                        VideoSynthesisQueue.update_status(queue_id, VideoSynthesisQueue.STATUS_PENDING)
+                    logger.info(f'合成最终视频 {idx + 1}/{total_segments}: {os.path.basename(final_video_file)}')
+                    result = subprocess.run(step4_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600)
+                    if result.returncode != 0:
+                        logger.error(f'合成最终视频失败: {result.stderr}')
                         continue
                     
-                    logger.info(f'步骤1 完成: 队列 {queue_id} 的 {len(temp_video_files)} 个临时视频已生成')
+                    VideoSegment.create(project_id, idx, segment_duration, os.path.basename(final_video_file))
+                    VideoSegment.update_status(VideoSegment.get_by_project(project_id)[-1].id, VideoSegment.STATUS_COMPLETED)
                     
-                    # 步骤2：合并该队列的所有临时视频为最终输出视频
-                    logger.info(f'步骤2: 合并队列 {queue_id} 的 {len(temp_video_files)} 个视频 -> {os.path.basename(output_video_path)}')
-                    
-                    # 检查输出文件是否已存在，如果存在则删除
-                    if os.path.exists(output_video_path):
-                        try:
-                            os.remove(output_video_path)
-                            logger.info(f'删除已存在的输出视频: {output_video_path}')
-                        except Exception as e:
-                            logger.warning(f'删除输出文件失败: {str(e)}')
-                    
-                    # 使用 FFmpeg 的 -c copy 参数进行快速拼接（无需转码）
-                    VideoService._merge_and_save_videos(
-                        temp_video_files,
-                        output_video_path,
-                        config,
-                        temp_video_dir
-                    )
-                    
-                    logger.info(f'步骤2 完成: 队列 {queue_id} 的视频已合并')
-                    
-                    # 步骤3：最终视频合成完毕，立即改变队列状态为 COMPLETED
-                    logger.info(f'步骤3: 最终视频合成完毕，更新队列状态为 COMPLETED')
-                    VideoSynthesisQueue.update_status(queue_id, VideoSynthesisQueue.STATUS_COMPLETED)
-                    logger.info(f'✓ 队列 {queue_id} (video_{video_index}) 状态已改为 COMPLETED')
-                    
-                    # 步骤4：删除对应的临时视频
-                    logger.info(f'步骤4: 删除临时视频文件并更新数据库状态')
-                    delete_count = 0
-                    for temp_segment_record in temp_segment_records:
-                        try:
-                            temp_video_abs_path = temp_segment_record.get_absolute_temp_video_path()
-                            if os.path.exists(temp_video_abs_path):
-                                os.remove(temp_video_abs_path)
-                                logger.debug(f'已删除临时文件: {temp_video_abs_path}')
-                                delete_count += 1
-                        except Exception as e:
-                            logger.warning(f'删除临时文件失败: temp_segment_id={temp_segment_record.id}, error={str(e)}')
-                        
-                        # 更新临时视频段状态：MERGED -> DELETED
-                        TempVideoSegment.update_status(temp_segment_record.id, TempVideoSegment.STATUS_MERGED)
-                        TempVideoSegment.update_status(temp_segment_record.id, TempVideoSegment.STATUS_DELETED)
-                    
-                    logger.info(f'步骤4 完成: 已删除 {delete_count} 个临时视频文件，数据库状态已更新为 DELETED')
-                    
-                    # 步骤5：创建 VideoSegment 数据库记录
-                    logger.info(f'步骤5: 创建 VideoSegment 数据库记录')
-                    relative_video_path = os.path.relpath(output_video_path, output_path)
-                    segment_id = VideoSegment.create(
-                        project_id,
-                        video_index - 1,
-                        total_duration,
-                        relative_video_path
-                    )
-                    VideoSegment.update_status(segment_id, VideoSegment.STATUS_COMPLETED)
-                    logger.info(f'步骤5 完成: VideoSegment 记录已创建 (segment_id={segment_id})')
-                    logger.info(f'✓ 队列 {queue_id} (video_{video_index}) 全部处理完成！输出文件: {output_video_path}')
+                    logger.info(f'✓ 视频段落 {idx + 1}/{total_segments} 处理完成')
                     
                 except Exception as e:
-                    logger.error(f'处理队列失败: queue_id={queue_id}, error={str(e)}')
-                    # 恢复队列状态为待处理
-                    VideoSynthesisQueue.update_status(queue_id, VideoSynthesisQueue.STATUS_PENDING)
-                    # 队列处理失败时停止整个流程，不继续处理后续队列
-                    logger.error(f'由于队列 {queue_id} 处理失败，停止视频合成流程')
-                    return False
+                    logger.error(f'处理音频片段失败: idx={idx}, error={str(e)}')
+                    continue
                 
                 finally:
-                    completed_queue += 1
-                    progress = completed_queue / total_queue * 100
+                    progress = (idx + 1) / total_segments * 100
                     Task.update_progress(task_id, progress)
             
-            logger.info(f'所有队列处理完成')
+            logger.info(f'步骤5: 清理临时文件')
+            deleted_count = 0
+            
+            try:
+                if os.path.exists(temp_video_file):
+                    os.remove(temp_video_file)
+                    deleted_count += 1
+                    logger.info(f'已删除临时视频: temp_video_fixed.mp4')
+            except Exception as e:
+                logger.warning(f'删除临时视频失败: {e}')
+            
+            try:
+                if os.path.exists(long_audio_file):
+                    os.remove(long_audio_file)
+                    deleted_count += 1
+                    logger.info(f'已删除长音频: long_audio_all.mp3')
+            except Exception as e:
+                logger.warning(f'删除长音频失败: {e}')
+            
+            for f in audio_segments:
+                try:
+                    if os.path.exists(f):
+                        os.remove(f)
+                        deleted_count += 1
+                except:
+                    pass
+            
+            logger.info(f'步骤5 完成: 已删除 {deleted_count} 个临时文件')
+            logger.info(f'✓ 视频合成全部完成，临时文件已清理')
             return True
             
         except Exception as e:
-            logger.error(f'队列驱动的视频合成失败: {str(e)}', exc_info=True)
+            logger.error(f'视频合成失败: {str(e)}', exc_info=True)
             return False
     
     @staticmethod
@@ -663,14 +598,17 @@ class VideoService:
             logger.warning(f'输出文件大小为0: {output_file}')
             return False
         
-        # 验证视频時長是否有效（通过尝试打开）
+        # 验证视频时长是否有效（通过 ffprobe）
         try:
-            from moviepy.editor import VideoFileClip
-            clip = VideoFileClip(output_file)
-            duration = clip.duration
-            clip.close()
+            import subprocess
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+                 '-of', 'default=noprint_wrappers=1:nokey=1', output_file],
+                capture_output=True, text=True, encoding='utf-8'
+            )
+            duration = float(result.stdout.strip())
             if duration <= 0:
-                logger.warning(f'输出视频時長不有效: {output_file}, duration={duration}')
+                logger.warning(f'输出视频时长不有效: {output_file}, duration={duration}')
                 return False
             return True
         except Exception as e:
@@ -811,7 +749,157 @@ class VideoService:
         except Exception as e:
             logger.error(f'视频拼接失败: {str(e)}')
             raise
-
+    
+    @staticmethod
+    def _merge_audio_files(audio_files, output_file):
+        """
+        使用 FFmpeg 合并多个音频文件为一个长音频
+        
+        Args:
+            audio_files: 音频文件路径列表
+            output_file: 输出音频文件路径
+            
+        Returns:
+            成功标志
+        """
+        import subprocess
+        
+        if not audio_files:
+            raise Exception('没有音频文件')
+        
+        try:
+            if len(audio_files) == 1:
+                logger.info(f'只有一个音频文件，直接复制')
+                output_dir = os.path.dirname(output_file)
+                FileHandler.ensure_dir(output_dir)
+                import shutil
+                shutil.copy(audio_files[0], output_file)
+                logger.info(f'音频文件复制完成: {output_file}')
+                return True
+            
+            logger.info(f'开始合并 {len(audio_files)} 个音频文件')
+            
+            temp_dir = os.path.dirname(output_file)
+            FileHandler.ensure_dir(temp_dir)
+            
+            concat_file = os.path.join(temp_dir, 'audio_concat_list.txt')
+            with open(concat_file, 'w', encoding='utf-8') as f:
+                for audio_file in audio_files:
+                    f.write(f"file '{os.path.abspath(audio_file)}'\n")
+            
+            merge_cmd = [
+                'ffmpeg',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', concat_file,
+                '-c', 'copy',
+                '-y',
+                output_file
+            ]
+            
+            logger.info(f'FFmpeg 音频合并命令: {" ".join(merge_cmd)}')
+            result = subprocess.run(merge_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3600)
+            
+            try:
+                if os.path.exists(concat_file):
+                    os.remove(concat_file)
+            except:
+                pass
+            
+            if result.returncode != 0:
+                error_msg = result.stderr if result.stderr else '未知错误'
+                logger.error(f'FFmpeg 音频合并失败: {error_msg}')
+                raise Exception(f'FFmpeg 音频合并失败: {error_msg}')
+            
+            logger.info(f'音频合并成功: {output_file}')
+            return True
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f'FFmpeg 音频合并超时')
+            raise Exception('FFmpeg 音频合并超时')
+        except Exception as e:
+            logger.error(f'音频合并失败: {str(e)}')
+            raise
+    
+    @staticmethod
+    def _split_audio_by_duration(input_audio, output_dir, duration):
+        """
+        按固定时长分割音频文件
+        
+        Args:
+            input_audio: 输入音频文件路径
+            output_dir: 输出目录
+            duration: 每个片段的时长（秒）
+            
+        Returns:
+            分割后的音频文件路径列表
+        """
+        import subprocess
+        
+        if not os.path.exists(input_audio):
+            raise Exception(f'音频文件不存在: {input_audio}')
+        
+        try:
+            FileHandler.ensure_dir(output_dir)
+            
+            audio_files = []
+            segment_index = 0
+            current_start = 0.0
+            
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+                 '-of', 'default=noprint_wrappers=1:nokey=1', input_audio],
+                capture_output=True, text=True, encoding='utf-8', timeout=30
+            )
+            total_duration = float(result.stdout.strip()) if result.returncode == 0 else 0
+            logger.info(f'音频总时长: {total_duration}s')
+            
+            logger.info(f'开始按 {duration}s 分割音频: {input_audio}')
+            
+            while True:
+                if current_start >= total_duration:
+                    logger.info(f'已到达音频末尾，停止分割')
+                    break
+                
+                segment_output = os.path.join(output_dir, f'audio_segment_{segment_index:03d}.mp3')
+                
+                ffmpeg_cmd = [
+                    'ffmpeg',
+                    '-i', input_audio,
+                    '-ss', str(current_start),
+                    '-t', str(duration),
+                    '-c', 'copy',
+                    '-y',
+                    segment_output
+                ]
+                
+                result = subprocess.run(
+                    ffmpeg_cmd,
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600
+                )
+                
+                if result.returncode != 0:
+                    logger.warning(f'分割音频片段失败: segment_index={segment_index}, {result.stderr}')
+                    break
+                
+                file_size = os.path.getsize(segment_output) if os.path.exists(segment_output) else 0
+                if file_size > 10240:
+                    audio_files.append(segment_output)
+                    segment_index += 1
+                    current_start += duration
+                else:
+                    logger.info(f'音频片段过小({file_size}字节)，视为已结束')
+                    if os.path.exists(segment_output):
+                        os.remove(segment_output)
+                    break
+            
+            logger.info(f'音频分割完成: 共 {len(audio_files)} 个片段')
+            return audio_files
+            
+        except Exception as e:
+            logger.error(f'音频分割失败: {str(e)}')
+            raise
+    
     @staticmethod
     def _check_disk_space(segments, temp_dir):
         """
@@ -924,219 +1012,4 @@ class VideoService:
         
         logger.info(f'背景图片生成成功: {image_path}')
         return image_path
-    
-    @staticmethod
-    def _create_and_save_video_segment(audio_path, image_path, output_path, config):
-        """
-        创建单个视频片段并立即保存到文件（内存优化版本）
-        
-        优点：
-        - 创建后立即保存到文件，不在内存中留存clip对象
-        - 避免同时在内存中保留大量视频片段
-        - 使用PIL直接读取图片，比imageio更高效
-        
-        Args:
-            audio_path: 音频文件路径
-            image_path: 图片文件路径
-            output_path: 输出视频文件路径
-            config: 配置字典
-        """
-        import numpy as np
-        from moviepy.editor import ImageClip, AudioFileClip
-        
-        fps = config.get('fps', DefaultConfig.DEFAULT_FPS)
-        bitrate = config.get('bitrate', DefaultConfig.DEFAULT_BITRATE)
-        
-        # 安全地解析resolution参数
-        try:
-            resolution = config.get('resolution', DefaultConfig.DEFAULT_RESOLUTION)
-            if isinstance(resolution, str):
-                resolution = tuple(map(int, resolution.split(',')))
-            elif isinstance(resolution, (list, tuple)):
-                resolution = tuple(resolution)
-            else:
-                resolution = DefaultConfig.DEFAULT_RESOLUTION
-        except Exception as e:
-            logger.warning(f'分辨率参数解析失败: {str(e)}, 使用默认分辨率')
-            resolution = DefaultConfig.DEFAULT_RESOLUTION
-        
-        # 获取硬件优化参数
-        try:
-            optimizer = get_optimizer()
-            optimal_params = optimizer.get_optimal_params(fps=fps, bitrate=bitrate, resolution=resolution)
-            logger.debug(f'创建视频片段优化参数: codec={optimal_params["codec"]}, preset={optimal_params["preset"]}, threads={optimal_params["threads"]}')
-            # 刷新日志处理器，确保日志立即输出
-            for handler in logger.handlers:
-                if hasattr(handler, 'flush'):
-                    try:
-                        handler.flush()
-                    except:
-                        pass
-        except Exception as e:
-            logger.error(f'获取硬件优化参数失败: {str(e)}', exc_info=True)
-            # 使用默认参数
-            optimal_params = {
-                'fps': fps,
-                'bitrate': bitrate,
-                'codec': 'libx264',
-                'preset': 'ultrafast',
-                'threads': 2
-            }
-        
-        # 初始化资源变量
-        audio_clip = None
-        image_clip = None
-        video_clip = None
-        pil_image = None
-        
-        try:
-            # 检查输入文件是否存在
-            if not os.path.exists(audio_path):
-                raise FileNotFoundError(f"音频文件不存在: {audio_path}")
-            
-            if not os.path.exists(image_path):
-                raise FileNotFoundError(f"图片文件不存在: {image_path}")
-            
-            # 加载音频
-            audio_clip = AudioFileClip(audio_path)
-            duration = audio_clip.duration
-            
-            # 使用PIL直接读取图片
-            pil_image = Image.open(image_path)
-            if pil_image.mode != 'RGB':
-                pil_image = pil_image.convert('RGB')
-            
-            # 转换为numpy数组
-            image_array = np.array(pil_image)
-            
-            # 创建ImageClip
-            image_clip = ImageClip(image_array, duration=duration)
-            image_clip = image_clip.set_fps(fps)
-            
-            # 设置音频
-            video_clip = image_clip.set_audio(audio_clip)
-            
-            # 确保输出目录存在
-            output_dir = os.path.dirname(output_path)
-            FileHandler.ensure_dir(output_dir)
-            
-            # 立即保存到文件，强制使用磁盘缓冲
-            output_dir = os.path.dirname(output_path)
-            output_basename = os.path.basename(output_path)
-            temp_audio_file = os.path.join(output_dir, f'{output_basename}_audio_temp.m4a')
-            
-            video_clip.write_videofile(
-                output_path,
-                fps=optimal_params['fps'],
-                codec=optimal_params['codec'],
-                bitrate=optimal_params['bitrate'],
-                audio_codec='aac',
-                temp_audiofile=temp_audio_file,
-                remove_temp=True,
-                logger=None,
-                threads=optimal_params['threads']
-            )
-            
-        except MemoryError as e:
-            logger.error(f'创建视频片段时内存不足: audio_path={audio_path}, error={str(e)}')
-            raise
-        except Exception as e:
-            logger.error(f'创建视频片段失败: audio_path={audio_path}, error={str(e)}')
-            raise
-        finally:
-            # 确保释放所有资源
-            try:
-                if video_clip:
-                    video_clip.close()
-            except:
-                pass
-            try:
-                if audio_clip:
-                    audio_clip.close()
-            except:
-                pass
-            try:
-                if image_clip:
-                    image_clip.close()
-            except:
-                pass
-            try:
-                if pil_image:
-                    pil_image.close()
-            except:
-                pass
-    
-    @staticmethod
-    def _create_video_clip(audio_path, image_path, config):
-        """
-        创建视频片段（内存优化版本）
-        
-        使用 PIL 直接读取图片数据，避免 ImageClip 的重复加载导致的内存溢出
-        
-        Args:
-            audio_path: 音频文件路径
-            image_path: 图片文件路径
-            config: 配置字典
-            
-        Returns:
-            视频片段对象
-        """
-        import numpy as np
-        from moviepy.editor import ImageClip, AudioFileClip
-        
-        fps = config.get('fps', DefaultConfig.DEFAULT_FPS)
-        
-        # 初始化资源变量
-        audio_clip = None
-        pil_image = None
-        
-        try:
-            # 检查输入文件是否存在
-            if not os.path.exists(audio_path):
-                raise FileNotFoundError(f"音频文件不存在: {audio_path}")
-            
-            if not os.path.exists(image_path):
-                raise FileNotFoundError(f"图片文件不存在: {image_path}")
-            
-            # 加载音频
-            audio_clip = AudioFileClip(audio_path)
-            duration = audio_clip.duration
-            
-            # 使用 PIL 直接读取图片，避免 ImageClip 的内存问题
-            # PIL 的内存管理比 imageio 更高效
-            pil_image = Image.open(image_path)
-            # 转换为 RGB 格式（如果需要）
-            if pil_image.mode != 'RGB':
-                pil_image = pil_image.convert('RGB')
-            
-            # 转换为 numpy 数组
-            image_array = np.array(pil_image)
-            
-            # 从 numpy 数组创建 ImageClip（这样可以避免 imageio 的内存溢出问题）
-            image_clip = ImageClip(image_array, duration=duration)
-            image_clip = image_clip.set_fps(fps)
-            
-            # 设置音频
-            video_clip = image_clip.set_audio(audio_clip)
-            
-            return video_clip
-            
-        except MemoryError as e:
-            logger.error(f'创建视频片段时内存不足: audio_path={audio_path}, error={str(e)}')
-            raise
-        except Exception as e:
-            logger.error(f'创建视频片段失败: audio_path={audio_path}, error={str(e)}')
-            raise
-        finally:
-            # 确保释放资源
-            try:
-                if audio_clip:
-                    audio_clip.close()
-            except:
-                pass
-            try:
-                if pil_image:
-                    pil_image.close()
-            except:
-                pass
     

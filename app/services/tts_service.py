@@ -173,12 +173,15 @@ class TTSService:
                 
                 # 验证文件是否生成
                 if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-                    # 读取音频时长
+                    # 使用 ffprobe 读取音频时长
                     try:
-                        from moviepy.editor import AudioFileClip
-                        audio_clip = AudioFileClip(audio_path)
-                        duration = audio_clip.duration
-                        audio_clip.close()
+                        import subprocess
+                        result = subprocess.run(
+                            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+                             '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
+                            capture_output=True, text=True, encoding='utf-8'
+                        )
+                        duration = float(result.stdout.strip())
                         logger.info(f'音频时长: {duration:.2f}秒')
                     except Exception as e:
                         logger.warning(f'读取音频时长失败: {str(e)}')

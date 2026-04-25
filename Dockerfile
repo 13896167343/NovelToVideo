@@ -11,11 +11,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FLASK_ENV=production \
     PIP_NO_CACHE_DIR=1
 
-# 安装系统依赖（gcc用于编译Python包，ffmpeg用于视频处理）
+# 安装系统依赖（gcc用于编译Python包，ffmpeg用于视频处理，支持libx264）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    wget \
+    unzip \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && wget -O /tmp/ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-essentials.xz \
+    && cd /tmp \
+    && tar -xf ffmpeg.tar.xz \
+    && cp -f ffmpeg-*/ffmpeg /usr/local/bin/ \
+    && cp -f ffmpeg-*/ffprobe /usr/local/bin/ \
+    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
+    && rm -rf /tmp/ffmpeg*
 
 # 复制依赖文件
 COPY requirements.txt .
