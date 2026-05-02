@@ -47,6 +47,13 @@ class TTSService:
                 return False, error_msg
             config = project.config if isinstance(project.config, dict) else {}
             
+            # 重置之前意外中断的 synthesizing 状态段落为 pending，避免遗漏
+            TextSegment.reset_audio_status_by_project(
+                project_id,
+                TextSegment.AUDIO_STATUS_SYNTHESIZING,
+                TextSegment.AUDIO_STATUS_PENDING
+            )
+            
             # 获取待处理的段落
             segments = TextSegment.get_pending_segments(project_id)
             total_segments = len(segments)
