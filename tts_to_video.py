@@ -24,6 +24,7 @@ class TTSVideoSynthesizer:
         self.audio_dir = None
         self.image_dir = None
         self.output_dir = None
+        self.video_name = None
         self.segment_duration = 30
         self.audio_files = []
         self.temp_dir = None
@@ -138,6 +139,14 @@ class TTSVideoSynthesizer:
                 self._print_error("请输入有效的数字")
                 continue
 
+        while True:
+            video_name_input = input("\n请输入视频名称（用于输出文件名）: ").strip()
+            if not video_name_input:
+                self._print_error("视频名称不能为空")
+                continue
+            self.video_name = video_name_input
+            break
+
         # 显示配置摘要
         print("\n" + "-"*60)
         print("  配置摘要:")
@@ -145,6 +154,7 @@ class TTSVideoSynthesizer:
         print(f"  - 音频文件数量: {len(self.audio_files)}")
         print(f"  - 背景图片: {self.image_dir}")
         print(f"  - 输出目录: {self.output_dir}")
+        print(f"  - 视频名称: {self.video_name}")
         print(f"  - 视频片段时长: {self.segment_duration}秒")
         print("-"*60)
 
@@ -482,7 +492,7 @@ class TTSVideoSynthesizer:
         success_count = 0
 
         for idx, audio_segment in enumerate(audio_segments, 1):
-            output_video_file = os.path.join(self.output_dir, f'video_{idx:03d}.mp4')
+            output_video_file = os.path.join(self.output_dir, f'{self.video_name}_{idx:03d}.mp4')
 
             self._print_progress(idx, total_segments, f"处理 {idx}/{total_segments}")
 
