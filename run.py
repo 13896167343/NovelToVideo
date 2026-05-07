@@ -1,6 +1,7 @@
 """应用入口文件"""
 import sys
 import os
+import atexit
 from pathlib import Path
 
 # 添加项目根目录到Python路径
@@ -9,12 +10,22 @@ sys.path.insert(0, str(project_root))
 
 from app import create_app
 from app.utils.database import init_db
-from app.utils.logger import get_logger
+from app.utils.logger import get_logger, shutdown_logger
 from app.utils.migrations import run_migrations
 from app.utils.file_handler import FileHandler
-from config import DevelopmentConfig, ProductionConfig
+from config import DevelopmentConfig, ProductionConfig, DefaultConfig
 
 logger = get_logger(__name__)
+
+
+def cleanup():
+    """程序退出清理函数"""
+    logger.info('正在关闭日志系统...')
+    shutdown_logger()
+    logger.info('程序退出')
+
+
+atexit.register(cleanup)
 
 
 def main():
@@ -48,9 +59,14 @@ def main():
             logger.error(f'数据库迁移异常: {str(e)}', exc_info=True)
         
         # 清理过期的临时文件（超过24小时的）
+        # 注意：排除 audio、images 目录（永不删除），保留 video_segments 的过期清理
         try:
             if os.path.exists(DefaultConfig.TEMP_DIR):
-                FileHandler.clean_temp_files(DefaultConfig.TEMP_DIR, max_age_hours=24)
+                FileHandler.clean_temp_files(
+                    DefaultConfig.TEMP_DIR,
+                    max_age_hours=24,
+                    exclude_dirs=['audio', 'images']
+                )
                 logger.info('临时文件清理完成')
         except Exception as e:
             logger.warning(f'临时文件清理失败: {str(e)}')

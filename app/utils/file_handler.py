@@ -105,21 +105,27 @@ class FileHandler:
         return total_size
     
     @staticmethod
-    def clean_temp_files(directory, max_age_hours=24):
+    def clean_temp_files(directory, max_age_hours=24, exclude_dirs=None):
         """
         清理临时文件
         
         Args:
             directory: 目录路径
             max_age_hours: 文件最大保留时间(小时)
+            exclude_dirs: 要排除的子目录列表（如 ['audio', 'images']）
         """
         import time
+        
+        if exclude_dirs is None:
+            exclude_dirs = []
         
         try:
             current_time = time.time()
             max_age_seconds = max_age_hours * 3600
             
             for dirpath, dirnames, filenames in os.walk(directory):
+                dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
+                
                 for filename in filenames:
                     file_path = os.path.join(dirpath, filename)
                     if os.path.exists(file_path):
