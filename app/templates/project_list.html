@@ -15,6 +15,9 @@
         <a href="{{ url_for('project.create') }}" class="btn btn-primary btn-lg" data-aos="zoom-in">
             <i class="fas fa-plus-circle me-2"></i>创建新项目
         </a>
+        <button type="button" class="btn btn-danger btn-lg" onclick="deleteAllProjects()" data-aos="zoom-in" id="btnDeleteAll">
+            <i class="fas fa-trash-alt me-2"></i>删除所有项目
+        </button>
     </div>
     
     {% if projects %}
@@ -218,6 +221,42 @@ function performDelete(button, projectId) {
         button.disabled = false;
         button.innerHTML = '<i class="fas fa-trash"></i>';
     });
+}
+
+function deleteAllProjects() {
+    const projectIds = Array.from(document.querySelectorAll('[data-project-id]')).map(btn => btn.getAttribute('data-project-id'));
+    
+    if (projectIds.length === 0) {
+        toastr.warning('没有项目可删除');
+        return;
+    }
+    
+    if (confirm(`确定要删除所有 ${projectIds.length} 个项目吗？此操作不可恢复！`)) {
+        const btn = document.getElementById('btnDeleteAll');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 删除中...';
+        
+        Promise.all(projectIds.map(id => 
+            fetch(`/project/${id}/delete`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            }).then(res => res.json())
+        ))
+        .then(results => {
+            const failed = results.filter(r => !r.success).length;
+            if (failed === 0) {
+                toastr.success('所有项目删除成功');
+            } else {
+                toastr.warning(`删除完成，${failed} 个项目删除失败`);
+            }
+            setTimeout(() => location.reload(), 1500);
+        })
+        .catch(error => {
+            toastr.error('删除失败: ' + error.message);
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fas fa-trash-alt me-2"></i>删除所有项目';
+        });
+    }
 }
 </script>
 {% endblock %}
