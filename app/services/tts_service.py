@@ -57,19 +57,32 @@ class TTSService:
             # 获取待处理的段落
             segments = TextSegment.get_pending_segments(project_id)
             total_segments = len(segments)
-            
+
+            # 确保临时目录存在
+            temp_audio_dir = os.path.join(DefaultConfig.TEMP_AUDIO_DIR, str(project_id))
+            FileHandler.ensure_dir(temp_audio_dir)
+
             if total_segments == 0:
                 logger.info(f'没有待合成的段落: 项目ID={project_id}')
+                # 仍执行音频完整性校验，清理历史遗留的空文件并重置对应段落
+                broken_count, broken_ids = TTSService.verify_audio_integrity(project_id)
+                if broken_count > 0:
+                    logger.warning(f'检测到 {broken_count} 个历史遗留的损坏音频，自动重新合成')
+                    resynth_ok, resynth_fail = TTSService._resynthesize_segments(
+                        project_id, broken_ids, config, temp_audio_dir
+                    )
+                    if resynth_fail > 0:
+                        error_msg = f'损坏音频重新合成失败: 成功{resynth_ok}, 失败{resynth_fail}'
+                        Task.update_status(task_id, Task.STATUS_FAILED, error_msg)
+                        Project.update_status(project_id, Project.STATUS_FAILED)
+                        return False, error_msg
+                    logger.info(f'损坏音频重新合成完成: 成功{resynth_ok}')
                 # 无段落可处理，任务直接完成，并将项目状态更新为已完成，避免页面长时间处于"处理中"
                 Task.update_status(task_id, Task.STATUS_COMPLETED)
                 Project.update_status(project_id, Project.STATUS_COMPLETED)
                 return True, None
-            
+
             logger.info(f'开始语音合成: 项目ID={project_id}, 段落数={total_segments}')
-            
-            # 确保临时目录存在
-            temp_audio_dir = os.path.join(DefaultConfig.TEMP_AUDIO_DIR, str(project_id))
-            FileHandler.ensure_dir(temp_audio_dir)
             
             # 多线程处理
             completed_count = 0
@@ -95,6 +108,28 @@ class TTSService:
             
             # 完成任务
             if failed_count == 0:
+                # 音频完整性校验：清理空文件并将损坏段落重置为 pending，
+                # 避免 ffmpeg concat demuxer 在视频合成时遇错中断整次合并
+                broken_count, broken_ids = TTSService.verify_audio_integrity(project_id)
+                if broken_count > 0:
+                    logger.warning(f'检测到 {broken_count} 个音频文件缺失或为空，自动重新合成')
+                    resynth_ok, resynth_fail = TTSService._resynthesize_segments(
+                        project_id, broken_ids, config, temp_audio_dir
+                    )
+                    if resynth_fail > 0:
+                        error_msg = f'音频完整性校验后重新合成仍失败: 成功{resynth_ok}, 失败{resynth_fail}'
+                        Task.update_status(task_id, Task.STATUS_FAILED, error_msg)
+                        Project.update_status(project_id, Project.STATUS_FAILED)
+                        return False, error_msg
+                    # 重新合成成功后再校验一次，确保无残留问题
+                    broken_count2, _ = TTSService.verify_audio_integrity(project_id)
+                    if broken_count2 > 0:
+                        error_msg = f'重新合成后仍有 {broken_count2} 个音频文件损坏'
+                        Task.update_status(task_id, Task.STATUS_FAILED, error_msg)
+                        Project.update_status(project_id, Project.STATUS_FAILED)
+                        return False, error_msg
+                    logger.info(f'损坏音频重新合成完成: 成功{resynth_ok}')
+
                 Task.update_status(task_id, Task.STATUS_COMPLETED)
                 logger.info(f'语音合成完成: 项目ID={project_id}')
                 return True, None
@@ -264,5 +299,105 @@ class TTSService:
                 logger.warning('1. 确保网络连接正常')
                 logger.warning('2. 检查防火墙或代理设置')
                 logger.warning('3. 确认可以访问 speech.platform.bing.com')
-                
+
             raise
+
+    @staticmethod
+    def verify_audio_integrity(project_id):
+        """
+        验证项目所有已完成音频文件是否真实存在且非空
+
+        历史上发生过 DB 标记 completed 但文件被中断/丢失的情况（如 segment_115.mp3 = 0 字节），
+        若不处理，后续 ffmpeg concat demuxer 会因此类文件中断整次合并。
+
+        对于缺失或为空的音频文件：
+        1. 删除该空文件（若存在）
+        2. 将数据库 audio_status 重置为 pending，以便重新合成
+
+        Args:
+            project_id: 项目ID
+
+        Returns:
+            (损坏数量, 损坏段落ID列表)
+        """
+        try:
+            segments = TextSegment.get_completed_segments(project_id)
+            if not segments:
+                return 0, []
+
+            broken_ids = []
+            for segment in segments:
+                audio_path = segment.get_absolute_audio_path()
+                # 文件缺失
+                if not os.path.exists(audio_path):
+                    logger.warning(
+                        f'音频完整性校验：文件缺失, segment_id={segment.id}, path={audio_path}'
+                    )
+                    TextSegment.update_audio_status(
+                        segment.id, TextSegment.AUDIO_STATUS_PENDING
+                    )
+                    broken_ids.append(segment.id)
+                    continue
+                # 文件为空
+                try:
+                    if os.path.getsize(audio_path) == 0:
+                        logger.warning(
+                            f'音频完整性校验：文件为空, segment_id={segment.id}, path={audio_path}'
+                        )
+                        try:
+                            os.remove(audio_path)
+                            logger.info(f'已删除空音频文件: {audio_path}')
+                        except OSError as e:
+                            logger.warning(f'删除空音频文件失败: {audio_path}, {e}')
+                        TextSegment.update_audio_status(
+                            segment.id, TextSegment.AUDIO_STATUS_PENDING
+                        )
+                        broken_ids.append(segment.id)
+                except OSError as e:
+                    logger.warning(
+                        f'音频完整性校验：读取文件失败, segment_id={segment.id}, path={audio_path}, {e}'
+                    )
+                    TextSegment.update_audio_status(
+                        segment.id, TextSegment.AUDIO_STATUS_PENDING
+                    )
+                    broken_ids.append(segment.id)
+
+            if broken_ids:
+                logger.warning(
+                    f'音频完整性校验完成: project_id={project_id}, 共发现 {len(broken_ids)} 个损坏文件, '
+                    f'已重置为 pending, ids={broken_ids}'
+                )
+            return len(broken_ids), broken_ids
+        except Exception as e:
+            logger.error(f'音频完整性校验异常: project_id={project_id}, {e}', exc_info=True)
+            return 0, []
+
+    @staticmethod
+    def _resynthesize_segments(project_id, segment_ids, config, temp_audio_dir):
+        """
+        重新合成指定的段落（用于音频完整性校验后的自动恢复）。
+
+        Args:
+            project_id: 项目ID
+            segment_ids: 段落ID列表
+            config: 项目配置
+            temp_audio_dir: 临时音频目录
+
+        Returns:
+            (成功数量, 失败数量)
+        """
+        completed = 0
+        failed = 0
+        for seg_id in segment_ids:
+            seg = TextSegment.get_by_id(seg_id)
+            if seg is None:
+                logger.warning(f'重新合成时未找到段落: segment_id={seg_id}')
+                continue
+            try:
+                TTSService._synthesize_segment(seg, config, temp_audio_dir)
+                completed += 1
+            except Exception as e:
+                logger.error(f'重新合成失败: segment_id={seg_id}, {e}')
+                failed += 1
+        logger.info(f'损坏音频重新合成结果: 成功={completed}, 失败={failed}')
+        return completed, failed

@@ -383,10 +383,10 @@ class VideoService:
             audio_files = []
             for segment in all_segments:
                 audio_abs_path = segment.get_absolute_audio_path()
-                if os.path.exists(audio_abs_path):
+                if os.path.exists(audio_abs_path) and os.path.getsize(audio_abs_path) > 0:
                     audio_files.append(audio_abs_path)
                 else:
-                    logger.warning(f'TTS音频文件不存在: {audio_abs_path}')
+                    logger.warning(f'TTS音频文件缺失或为空，跳过: segment_id={segment.id}, path={audio_abs_path}')
             
             if not audio_files:
                 logger.error(f'没有可用的TTS音频文件')
@@ -754,39 +754,66 @@ class VideoService:
     def _merge_audio_files(audio_files, output_file):
         """
         使用 FFmpeg 合并多个音频文件为一个长音频
-        
+
+        跳过空文件或缺失文件，避免 ffmpeg concat demuxer 中断整个合并流程。
+
         Args:
             audio_files: 音频文件路径列表
             output_file: 输出音频文件路径
-            
+
         Returns:
             成功标志
         """
         import subprocess
-        
+
         if not audio_files:
             raise Exception('没有音频文件')
-        
+
+        # 过滤空文件/缺失文件，避免 ffmpeg 在 concat 时遇错中断整次合并
+        valid_audio_files = []
+        skipped = []
+        for audio_file in audio_files:
+            if not os.path.exists(audio_file):
+                skipped.append((audio_file, '缺失'))
+                logger.warning(f'跳过缺失的音频文件: {audio_file}')
+                continue
+            try:
+                if os.path.getsize(audio_file) == 0:
+                    skipped.append((audio_file, '空文件'))
+                    logger.warning(f'跳过空音频文件: {audio_file}')
+                    continue
+            except OSError as e:
+                skipped.append((audio_file, f'读取失败: {e}'))
+                logger.warning(f'无法读取音频文件: {audio_file}, {e}')
+                continue
+            valid_audio_files.append(audio_file)
+
+        if not valid_audio_files:
+            raise Exception('没有可用的音频文件（全部缺失或为空）')
+
+        if skipped:
+            logger.warning(f'合并前已过滤 {len(skipped)} 个无效音频文件')
+
         try:
-            if len(audio_files) == 1:
-                logger.info(f'只有一个音频文件，直接复制')
+            if len(valid_audio_files) == 1:
+                logger.info(f'只有一个有效音频文件，直接复制')
                 output_dir = os.path.dirname(output_file)
                 FileHandler.ensure_dir(output_dir)
                 import shutil
-                shutil.copy(audio_files[0], output_file)
+                shutil.copy(valid_audio_files[0], output_file)
                 logger.info(f'音频文件复制完成: {output_file}')
                 return True
-            
-            logger.info(f'开始合并 {len(audio_files)} 个音频文件')
-            
+
+            logger.info(f'开始合并 {len(valid_audio_files)} 个音频文件')
+
             temp_dir = os.path.dirname(output_file)
             FileHandler.ensure_dir(temp_dir)
-            
+
             concat_file = os.path.join(temp_dir, 'audio_concat_list.txt')
             with open(concat_file, 'w', encoding='utf-8') as f:
-                for audio_file in audio_files:
+                for audio_file in valid_audio_files:
                     f.write(f"file '{os.path.abspath(audio_file)}'\n")
-            
+
             merge_cmd = [
                 'ffmpeg',
                 '-f', 'concat',
@@ -796,24 +823,24 @@ class VideoService:
                 '-y',
                 output_file
             ]
-            
+
             logger.info(f'FFmpeg 音频合并命令: {" ".join(merge_cmd)}')
             result = subprocess.run(merge_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3600)
-            
+
             try:
                 if os.path.exists(concat_file):
                     os.remove(concat_file)
             except:
                 pass
-            
+
             if result.returncode != 0:
                 error_msg = result.stderr if result.stderr else '未知错误'
                 logger.error(f'FFmpeg 音频合并失败: {error_msg}')
                 raise Exception(f'FFmpeg 音频合并失败: {error_msg}')
-            
+
             logger.info(f'音频合并成功: {output_file}')
             return True
-            
+
         except subprocess.TimeoutExpired:
             logger.error(f'FFmpeg 音频合并超时')
             raise Exception('FFmpeg 音频合并超时')
